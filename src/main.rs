@@ -3,6 +3,12 @@
 use chess::*;
 use std::collections::HashMap;
 use std::env;
+use std::thread;
+use std::sync::{Mutex, Arc};
+use std::net::TcpStream;
+mod networking;
+mod net;
+
 const image_folder : &'static str = "/Users/c14/repos/chess-ggez/target/debug";
 
 const SCREEN_SIZE: (f32, f32) = (
@@ -14,16 +20,21 @@ use ggez::{
     graphics::{self, Color, Rect},
     Context, GameResult,
 };
+
 use mint::Point2;
+
 struct MainState {
     pos_x: f32,
     circle: graphics::Mesh,
     squares : Vec<graphics::Mesh>,
     square_size : f32,
     img_map : HashMap<String, graphics::Image>,
-    chess_board : chess::ChessBoard,
+    chess_board : Arc<Mutex<chess::ChessBoard>>,
     selected_piece : Option<chess::Square>,
+    tcp_stream : Arc<Mutex<Option<TcpStream>>>,
+    is_server : bool,
 }
+
 fn piece_to_string(piece : chess::Piece, color : chess::Color) -> String {
     let mut built = "".to_owned();
     match color {
@@ -58,6 +69,7 @@ fn piece_to_string(piece : chess::Piece, color : chess::Color) -> String {
     }
     built
 }
+
 impl MainState {
     fn new(ctx: &mut Context) -> GameResult<MainState> {
         let circle = graphics::Mesh::new_circle(
@@ -134,15 +146,37 @@ impl MainState {
             "bK".to_string(), 
             graphics::Image::from_path(ctx, "/BK.png", true)?
         );
-        let chess_board = chess::ChessBoard::new();
+        let chess_board = Arc::new(Mutex::new(chess::ChessBoard::new()));
+        let netstuff = Self::start_networking(chess_board.clone());
+        let tcp_stream = netstuff.0;
+        let is_server = netstuff.1;
+        
         Ok(MainState { pos_x: 0.0, 
             circle, 
             squares : squares, 
             square_size : scale, 
             img_map :imgs, 
             chess_board,
-            selected_piece : None
+            selected_piece : None, 
+            tcp_stream,
+            is_server
         })
+    }
+    fn start_networking(chess_board : Arc<Mutex<chess::ChessBoard>>) -> (Arc<Mutex<Option<TcpStream>>>, bool) {
+        let args : Vec<String> = env::args().collect();
+        let is_server = args.len() <= 1;
+        println!("{:?}", args);
+        let tcp_stream = match is_server {
+            true => Arc::new(Mutex::new(Some(net::host()))),
+            false => Arc::new(Mutex::new(Some(net::connect())))
+    
+        }; 
+        let tcp_stream_for_recv_thread = tcp_stream.clone();
+        let board_for_recv_thread = chess_board.clone();
+        thread::spawn(move || {
+            net::recv(&tcp_stream_for_recv_thread, board_for_recv_thread, is_server);
+        });
+        (tcp_stream, is_server)
     }
 }
 
@@ -164,9 +198,11 @@ impl event::EventHandler<ggez::GameError> for MainState {
             let from_square = self.selected_piece.unwrap();
             let to_square = chosen;
             let mv = chess::Move::new(from_square, to_square);
-            if(self.chess_board.get_legal_moves_from_square(square).contains(&mv) && from_square != to_square) {
-                self.chess_board.make_move(mv);
-                println!("valid");
+            let mut chess_board = self.chess_board.lock().unwrap();
+            if(chess_board.get_legal_moves_from_square(from_square).contains(&mv) && from_square != to_square) {
+                chess_board.make_move(mv, true);
+                net::send_move(self.tcp_stream.clone(), mv, self.is_server);
+                println!("sent move!");
             }
             self.selected_piece = None;
         }
@@ -188,28 +224,34 @@ impl event::EventHandler<ggez::GameError> for MainState {
             let color_idx = ((i % 2) + ((i / 8) % 2)) % 2;
             canvas.draw(&self.squares[color_idx as usize], Point2 {x :  (offset_x * self.square_size), y : offset_y * self.square_size});
         }
+        
+        let mut chess_board = self.chess_board.lock().unwrap();
+
         for i in 0..64 {
             let offset_x = (i % 8) as f32;
             let offset_y = ((i as i32 / 8)) as f32;
-            let square: Square = chess::Square::new(7 - (i / 8), i % 8);
-            match (self.chess_board.get_square_piece(square)) {
+            let square : Square = chess::Square::new(7 - (i / 8), i % 8);
+            match (chess_board.get_square_piece(square)) {
                 chess::Piece::None => {},
                 _ => {
                     let dst;
+                    
                     if self.selected_piece.is_some() && self.selected_piece.unwrap() == square {
+
                         let m_pos = ggez::input::mouse::position(&ctx); 
                         dst = Point2 {x : -(self.square_size / 2.0) + m_pos.x, y : -(self.square_size / 2.0) + m_pos.y};
-                        println!("square: x{} y{}", self.selected_piece.unwrap().column, self.selected_piece.unwrap().row);
+                        // println!("square: x{} y{}", self.selected_piece.unwrap().column, self.selected_piece.unwrap().row);
                     } 
                     else {
                         dst = Point2 {x : offset_x * self.square_size, y : offset_y * self.square_size};
                     }
+                    
                     let drawparam = graphics::DrawParam::new()
                         .dest(dst)
                         .scale(Point2 {x : 0.35, y : 0.35});
 
 
-                    let img_key = piece_to_string(self.chess_board.get_square_piece(square), self.chess_board.get_square_color(square));
+                    let img_key = piece_to_string(chess_board.get_square_piece(square), chess_board.get_square_color(square));
                     canvas.draw(&self.img_map[&img_key], drawparam);
                 }
             } 
@@ -227,5 +269,8 @@ pub fn main() -> GameResult {
         .window_mode(ggez::conf::WindowMode::default().dimensions(SCREEN_SIZE.0, SCREEN_SIZE.1));
     let (mut ctx, event_loop) = cb.build()?;
     let state = MainState::new(&mut ctx)?;
+
+ 
+
     event::run(ctx, event_loop, state)
 }
